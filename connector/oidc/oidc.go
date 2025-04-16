@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -105,6 +106,8 @@ type Config struct {
 		NewGroupFromClaims []NewGroupFromClaims `json:"newGroupFromClaims"`
 		FilterGroupClaims  FilterGroupClaims    `json:"filterGroupClaims"`
 	} `json:"claimModifications"`
+
+	EnablePKCE bool `json:"enablePKCE"`
 }
 
 type ProviderDiscoveryOverrides struct {
@@ -307,6 +310,8 @@ func (c *Config) Open(id string, logger *slog.Logger) (conn connector.Connector,
 		groupsKey:                 c.ClaimMapping.GroupsKey,
 		newGroupFromClaims:        c.ClaimMutations.NewGroupFromClaims,
 		groupsFilter:              groupsFilter,
+		pkceVerifier:              make(map[string]string),
+		pkceEnabled:               c.EnablePKCE,
 	}, nil
 }
 
@@ -316,6 +321,7 @@ var (
 )
 
 type oidcConnector struct {
+	mtx                       sync.Mutex
 	provider                  *oidc.Provider
 	redirectURI               string
 	oauth2Config              *oauth2.Config
@@ -337,6 +343,23 @@ type oidcConnector struct {
 	groupsKey                 string
 	newGroupFromClaims        []NewGroupFromClaims
 	groupsFilter              *regexp.Regexp
+	pkceVerifier              map[string]string
+	pkceEnabled               bool
+}
+
+func (c *oidcConnector) getVerifier(key string) string {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	value := c.pkceVerifier[key]
+	delete(c.pkceVerifier, key)
+
+	return value
+}
+
+func (c *oidcConnector) setVerifier(key, value string) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	c.pkceVerifier[key] = value
 }
 
 func (c *oidcConnector) Close() error {
@@ -359,6 +382,13 @@ func (c *oidcConnector) LoginURL(s connector.Scopes, callbackURL, state string) 
 	if s.OfflineAccess {
 		opts = append(opts, oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("prompt", c.promptType))
 	}
+
+	if c.pkceEnabled {
+		verifier := oauth2.GenerateVerifier()
+		opts = append(opts, oauth2.S256ChallengeOption(verifier))
+		c.setVerifier(state, verifier)
+	}
+
 	return c.oauth2Config.AuthCodeURL(state, opts...), nil
 }
 
@@ -390,7 +420,23 @@ func (c *oidcConnector) HandleCallback(s connector.Scopes, r *http.Request) (ide
 
 	ctx := context.WithValue(r.Context(), oauth2.HTTPClient, c.httpClient)
 
-	token, err := c.oauth2Config.Exchange(ctx, q.Get("code"))
+	var opts []oauth2.AuthCodeOption
+
+	if c.pkceEnabled {
+		state := q.Get("state")
+		if state != "" {
+			return identity, fmt.Errorf("oidc: failed to get PKCE state for: %v", q.Encode())
+		}
+
+		verifier := c.getVerifier(state)
+		if verifier == "" {
+			return identity, fmt.Errorf("oidc: failed to get PKCE verifier for: %v", state)
+		}
+
+		opts = append(opts, oauth2.VerifierOption(verifier))
+	}
+
+	token, err := c.oauth2Config.Exchange(ctx, q.Get("code"), opts...)
 	if err != nil {
 		return identity, fmt.Errorf("oidc: failed to get token: %v", err)
 	}
