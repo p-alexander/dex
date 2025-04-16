@@ -424,7 +424,7 @@ func (c *oidcConnector) HandleCallback(s connector.Scopes, r *http.Request) (ide
 
 	if c.pkceEnabled {
 		state := q.Get("state")
-		if state != "" {
+		if state == "" {
 			return identity, fmt.Errorf("oidc: failed to get PKCE state for: %v", q.Encode())
 		}
 
