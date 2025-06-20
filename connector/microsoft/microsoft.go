@@ -63,6 +63,8 @@ type Config struct {
 	DomainHint string `json:"domainHint"`
 
 	Scopes []string `json:"scopes"` // defaults to scopeUser (user.read)
+
+	EnablePKCE bool `json:"enablePKCE"`
 }
 
 // Open returns a strategy for logging in through Microsoft.
@@ -83,6 +85,8 @@ func (c *Config) Open(id string, logger *slog.Logger) (connector.Connector, erro
 		promptType:           c.PromptType,
 		domainHint:           c.DomainHint,
 		scopes:               c.Scopes,
+		pkceVerifier:         make(map[string]string),
+		pkceEnabled:          c.EnablePKCE,
 	}
 
 	if m.apiURL == "" {
@@ -123,6 +127,7 @@ var (
 )
 
 type microsoftConnector struct {
+	mtx                  sync.Mutex
 	apiURL               string
 	graphURL             string
 	redirectURI          string
@@ -138,6 +143,23 @@ type microsoftConnector struct {
 	promptType           string
 	domainHint           string
 	scopes               []string
+	pkceVerifier         map[string]string
+	pkceEnabled          bool
+}
+
+func (c *microsoftConnector) getVerifier(key string) string {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	value := c.pkceVerifier[key]
+	delete(c.pkceVerifier, key)
+
+	return value
+}
+
+func (c *microsoftConnector) setVerifier(key, value string) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	c.pkceVerifier[key] = value
 }
 
 func (c *microsoftConnector) isOrgTenant() bool {
@@ -188,6 +210,12 @@ func (c *microsoftConnector) LoginURL(scopes connector.Scopes, callbackURL, stat
 		options = append(options, oauth2.SetAuthURLParam("domain_hint", c.domainHint))
 	}
 
+	if c.pkceEnabled {
+		verifier := oauth2.GenerateVerifier()
+		options = append(options, oauth2.S256ChallengeOption(verifier))
+		c.setVerifier(state, verifier)
+	}
+
 	return c.oauth2Config(scopes).AuthCodeURL(state, options...), nil
 }
 
@@ -201,7 +229,23 @@ func (c *microsoftConnector) HandleCallback(s connector.Scopes, r *http.Request)
 
 	ctx := r.Context()
 
-	token, err := oauth2Config.Exchange(ctx, q.Get("code"))
+	var opts []oauth2.AuthCodeOption
+
+	if c.pkceEnabled {
+		state := q.Get("state")
+		if state == "" {
+			return identity, fmt.Errorf("oidc: failed to get PKCE state for: %v", q.Encode())
+		}
+
+		verifier := c.getVerifier(state)
+		if verifier == "" {
+			return identity, fmt.Errorf("oidc: failed to get PKCE verifier for: %v", state)
+		}
+
+		opts = append(opts, oauth2.VerifierOption(verifier))
+	}
+
+	token, err := oauth2Config.Exchange(ctx, q.Get("code"), opts...)
 	if err != nil {
 		return identity, fmt.Errorf("microsoft: failed to get token: %v", err)
 	}
